@@ -1,0 +1,189 @@
+resource "aws_ecs_cluster" "this" {
+  count = var.cluster_arn == null ? 1 : 0
+
+  name = var.service_name
+
+  tags = merge(var.tags, {
+    Name = var.service_name
+  })
+}
+
+locals {
+  cluster_arn = var.cluster_arn != null ? var.cluster_arn : aws_ecs_cluster.this[0].id
+}
+
+resource "aws_cloudwatch_log_group" "this" {
+  name              = "/ecs/${var.service_name}"
+  retention_in_days = var.log_retention_days
+
+  tags = merge(var.tags, {
+    Name = "/ecs/${var.service_name}"
+  })
+}
+
+resource "aws_iam_role" "task_execution" {
+  name = "${var.service_name}-task-execution"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = merge(var.tags, {
+    Name = "${var.service_name}-task-execution"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "task_execution" {
+  role       = aws_iam_role.task_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_security_group" "this" {
+  name   = "${var.service_name}-sg"
+  vpc_id = var.vpc_id
+
+  tags = merge(var.tags, {
+    Name = "${var.service_name}-sg"
+  })
+}
+
+# Ingress from load balancer security group
+resource "aws_vpc_security_group_ingress_rule" "from_alb" {
+  count = var.enable_load_balancer && var.load_balancer_security_group_id != null ? 1 : 0
+
+  security_group_id            = aws_security_group.this.id
+  from_port                    = var.container_port
+  to_port                      = var.container_port
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = var.load_balancer_security_group_id
+  description                  = "Access from load balancer"
+
+  tags = merge(var.tags, {
+    Name = "${var.service_name}-ingress-from-lb"
+  })
+}
+
+# Ingress from anywhere when load balancer is disabled
+resource "aws_vpc_security_group_ingress_rule" "from_anywhere" {
+  count = !var.enable_load_balancer && var.allow_anywhere_access ? 1 : 0
+
+  security_group_id = aws_security_group.this.id
+  from_port         = var.container_port
+  to_port           = var.container_port
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  description       = "Access from anywhere when no load balancer"
+
+  tags = merge(var.tags, {
+    Name = "${var.service_name}-ingress-anywhere"
+  })
+}
+
+# Egress to anywhere
+resource "aws_vpc_security_group_egress_rule" "to_anywhere" {
+  security_group_id = aws_security_group.this.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = merge(var.tags, {
+    Name = "${var.service_name}-egress-all"
+  })
+}
+
+resource "aws_ecs_task_definition" "this" {
+  family                   = var.service_name
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = var.cpu
+  memory                   = var.memory
+  execution_role_arn       = aws_iam_role.task_execution.arn
+  task_role_arn            = var.task_role_arn
+
+  runtime_platform {
+    cpu_architecture        = var.architecture
+    operating_system_family = "LINUX"
+  }
+
+  container_definitions = jsonencode([
+    merge(
+      {
+        name  = var.service_name
+        image = var.image_uri
+
+        portMappings = [
+          {
+            containerPort = var.container_port
+            protocol      = "tcp"
+          }
+        ]
+
+        environment = [
+          for key, value in var.environment_variables : {
+            name  = key
+            value = value
+          }
+        ]
+
+        logConfiguration = {
+          logDriver = "awslogs"
+          options = {
+            "awslogs-group"         = aws_cloudwatch_log_group.this.name
+            "awslogs-region"        = data.aws_region.current.name
+            "awslogs-stream-prefix" = "ecs"
+          }
+        }
+
+        essential = true
+      },
+      var.health_check != null ? {
+        healthCheck = var.health_check
+      } : {}
+    )
+  ])
+
+  tags = merge(var.tags, {
+    Name = var.service_name
+  })
+
+  lifecycle {
+    ignore_changes = [container_definitions]
+  }
+}
+
+resource "aws_ecs_service" "this" {
+  name            = var.service_name
+  cluster         = local.cluster_arn
+  task_definition = aws_ecs_task_definition.this.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.subnet_ids
+    security_groups  = [aws_security_group.this.id]
+    assign_public_ip = var.assign_public_ip
+  }
+
+  dynamic "load_balancer" {
+    for_each = var.enable_load_balancer ? [1] : []
+    content {
+      target_group_arn = var.target_group_arn
+      container_name   = var.service_name
+      container_port   = var.container_port
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [desired_count]
+  }
+}
+
+data "aws_region" "current" {}
